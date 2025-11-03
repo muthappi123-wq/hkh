@@ -1,0 +1,449 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Send, FileText, ExternalLink, AlertCircle, CheckCircle, Loader2, User, Bot, X } from 'lucide-react';
+
+// Configuration - Update these with your actual values
+const API_BASE_URL = 'http://localhost:8000';
+const BLOB_BASE_URL = 'https://yourstorageaccount.blob.core.windows.net/yourcontainer';
+
+const App = () => {
+  const [messages, setMessages] = useState([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [userContext, setUserContext] = useState({
+    userId: 'user_001',
+    userName: 'John Doe',
+    userLocation: 'United States',
+    deviceType: 'web',
+    sessionId: `session_${Date.now()}`,
+    bearerToken: '',
+    scopeIndex: 0,
+    userCategory: 'general'
+  });
+  const [showSettings, setShowSettings] = useState(false);
+  const [selectedCitation, setSelectedCitation] = useState(null);
+  const messagesEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages]);
+
+  const sendMessage = async () => {
+    if (!input.trim() || loading) return;
+
+    const userMessage = {
+      type: 'user',
+      content: input,
+      timestamp: new Date().toISOString()
+    };
+
+    setMessages(prev => [...prev, userMessage]);
+    setInput('');
+    setLoading(true);
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/query`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          textInput: input,
+          userContext: userContext
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      const botMessage = {
+        type: 'bot',
+        content: data.responseText,
+        timestamp: new Date().toISOString(),
+        citations: data.documentCitations || [],
+        links: data.links || [],
+        exceptionLinks: data.exceptionLinks || [],
+        exceptionFlag: data.exceptionFlag || false,
+        topic: data.topic || '',
+        confidenceScore: data.confidenceScore || 0,
+        suggestedQuestions: data.suggestedQuestions || []
+      };
+
+      setMessages(prev => [...prev, botMessage]);
+    } catch (error) {
+      console.error('Error:', error);
+      const errorMessage = {
+        type: 'bot',
+        content: 'Sorry, I encountered an error processing your request. Please try again.',
+        timestamp: new Date().toISOString(),
+        isError: true
+      };
+      setMessages(prev => [...prev, errorMessage]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const openCitation = (citation) => {
+    setSelectedCitation(citation);
+  };
+
+  const closeCitationModal = () => {
+    setSelectedCitation(null);
+  };
+
+  const getBlobUrl = (blobFilepath) => {
+    if (!blobFilepath) return '#';
+    // If the filepath already contains the full URL, return it
+    if (blobFilepath.startsWith('http')) return blobFilepath;
+    // Otherwise, construct the URL
+    return `${BLOB_BASE_URL}/${blobFilepath}`;
+  };
+
+  return (
+    <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+      {/* Header */}
+      <header className="bg-white shadow-md border-b border-gray-200">
+        <div className="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
+          <div className="flex items-center space-x-3">
+            <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-lg flex items-center justify-center">
+              <Bot className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-gray-800">AI Assistant</h1>
+              <p className="text-xs text-gray-500">Multi-Index Retriever</p>
+            </div>
+          </div>
+          <button
+            onClick={() => setShowSettings(!showSettings)}
+            className="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg text-sm font-medium text-gray-700 transition-colors"
+          >
+            Settings
+          </button>
+        </div>
+      </header>
+
+      {/* Settings Panel */}
+      {showSettings && (
+        <div className="bg-white border-b border-gray-200 shadow-sm">
+          <div className="max-w-7xl mx-auto px-4 py-4">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">User Context</h3>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">User ID</label>
+                <input
+                  type="text"
+                  value={userContext.userId}
+                  onChange={(e) => setUserContext({...userContext, userId: e.target.value})}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">User Name</label>
+                <input
+                  type="text"
+                  value={userContext.userName}
+                  onChange={(e) => setUserContext({...userContext, userName: e.target.value})}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-600 mb-1">Country/Location</label>
+                <input
+                  type="text"
+                  value={userContext.userLocation}
+                  onChange={(e) => setUserContext({...userContext, userLocation: e.target.value})}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  placeholder="e.g., United States, India"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Chat Messages */}
+      <div className="flex-1 overflow-y-auto px-4 py-6">
+        <div className="max-w-4xl mx-auto space-y-6">
+          {messages.length === 0 && (
+            <div className="text-center py-12">
+              <div className="w-20 h-20 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                <Bot className="w-10 h-10 text-white" />
+              </div>
+              <h2 className="text-2xl font-bold text-gray-800 mb-2">How can I help you today?</h2>
+              <p className="text-gray-600">Ask me anything and I'll search through our knowledge base</p>
+            </div>
+          )}
+
+          {messages.map((message, index) => (
+            <div key={index} className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}>
+              <div className={`flex space-x-3 max-w-3xl ${message.type === 'user' ? 'flex-row-reverse space-x-reverse' : ''}`}>
+                {/* Avatar */}
+                <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
+                  message.type === 'user' 
+                    ? 'bg-gradient-to-br from-green-400 to-emerald-500' 
+                    : 'bg-gradient-to-br from-blue-500 to-indigo-600'
+                }`}>
+                  {message.type === 'user' ? (
+                    <User className="w-5 h-5 text-white" />
+                  ) : (
+                    <Bot className="w-5 h-5 text-white" />
+                  )}
+                </div>
+
+                {/* Message Content */}
+                <div className={`flex-1 ${message.type === 'user' ? 'items-end' : 'items-start'}`}>
+                  <div className={`rounded-2xl px-4 py-3 ${
+                    message.type === 'user'
+                      ? 'bg-gradient-to-br from-green-400 to-emerald-500 text-white'
+                      : message.isError
+                      ? 'bg-red-50 text-red-800 border border-red-200'
+                      : 'bg-white text-gray-800 shadow-sm border border-gray-200'
+                  }`}>
+                    {message.exceptionFlag && (
+                      <div className="flex items-center space-x-2 mb-2 pb-2 border-b border-gray-200">
+                        <AlertCircle className="w-4 h-4 text-orange-500" />
+                        <span className="text-xs font-medium text-orange-600">Exception Response</span>
+                      </div>
+                    )}
+                    
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
+
+                    {/* Confidence Score */}
+                    {message.confidenceScore > 0 && (
+                      <div className="mt-2 pt-2 border-t border-gray-200 flex items-center justify-between">
+                        <span className="text-xs text-gray-500">Confidence</span>
+                        <span className="text-xs font-medium text-blue-600">{message.confidenceScore}%</span>
+                      </div>
+                    )}
+
+                    {/* Topic */}
+                    {message.topic && (
+                      <div className="mt-1">
+                        <span className="inline-block px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded-full">
+                          {message.topic}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Citations */}
+                  {message.citations && message.citations.length > 0 && (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-xs font-semibold text-gray-600 flex items-center">
+                        <FileText className="w-3 h-3 mr-1" />
+                        Document Citations
+                      </p>
+                      <div className="space-y-1">
+                        {message.citations.map((citation, idx) => (
+                          <button
+                            key={idx}
+                            onClick={() => openCitation(citation)}
+                            className="flex items-center space-x-2 px-3 py-2 bg-blue-50 hover:bg-blue-100 rounded-lg text-xs text-left w-full transition-colors group"
+                          >
+                            <FileText className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                            <span className="text-blue-700 group-hover:text-blue-900 flex-1 truncate">
+                              {citation.displayText}
+                            </span>
+                            <ExternalLink className="w-3 h-3 text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Application Links */}
+                  {message.links && message.links.length > 0 && (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-xs font-semibold text-gray-600 flex items-center">
+                        <ExternalLink className="w-3 h-3 mr-1" />
+                        Related Links
+                      </p>
+                      <div className="space-y-1">
+                        {message.links.map((link, idx) => (
+                          <a
+                            key={idx}
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center space-x-2 px-3 py-2 bg-green-50 hover:bg-green-100 rounded-lg text-xs transition-colors group"
+                          >
+                            <ExternalLink className="w-4 h-4 text-green-500 flex-shrink-0" />
+                            <span className="text-green-700 group-hover:text-green-900 flex-1">
+                              {link.displayText}
+                            </span>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Exception Links */}
+                  {message.exceptionLinks && message.exceptionLinks.length > 0 && (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-xs font-semibold text-gray-600 flex items-center">
+                        <AlertCircle className="w-3 h-3 mr-1" />
+                        Exception Resources
+                      </p>
+                      <div className="space-y-1">
+                        {message.exceptionLinks.map((link, idx) => (
+                          <a
+                            key={idx}
+                            href={link.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center space-x-2 px-3 py-2 bg-orange-50 hover:bg-orange-100 rounded-lg text-xs transition-colors group"
+                          >
+                            <ExternalLink className="w-4 h-4 text-orange-500 flex-shrink-0" />
+                            <span className="text-orange-700 group-hover:text-orange-900 flex-1">
+                              {link.displayText}
+                            </span>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Suggested Questions */}
+                  {message.suggestedQuestions && message.suggestedQuestions.length > 0 && (
+                    <div className="mt-3 space-y-2">
+                      <p className="text-xs font-semibold text-gray-600">You might also ask:</p>
+                      <div className="space-y-1">
+                        {message.suggestedQuestions.map((question, idx) => (
+                          <button
+                            key={idx}
+                            onClick={() => setInput(question)}
+                            className="block w-full text-left px-3 py-2 bg-purple-50 hover:bg-purple-100 rounded-lg text-xs text-purple-700 hover:text-purple-900 transition-colors"
+                          >
+                            {question}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+
+          {loading && (
+            <div className="flex justify-start">
+              <div className="flex space-x-3 max-w-3xl">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center flex-shrink-0">
+                  <Bot className="w-5 h-5 text-white" />
+                </div>
+                <div className="bg-white rounded-2xl px-4 py-3 shadow-sm border border-gray-200">
+                  <div className="flex items-center space-x-2">
+                    <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
+                    <span className="text-sm text-gray-600">Thinking...</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div ref={messagesEndRef} />
+        </div>
+      </div>
+
+      {/* Input Area */}
+      <div className="bg-white border-t border-gray-200 shadow-lg">
+        <div className="max-w-4xl mx-auto px-4 py-4">
+          <div className="flex space-x-3">
+            <input
+              type="text"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyPress={handleKeyPress}
+              placeholder="Ask me anything..."
+              disabled={loading}
+              className="flex-1 px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
+            />
+            <button
+              onClick={sendMessage}
+              disabled={loading || !input.trim()}
+              className="px-6 py-3 bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-xl hover:from-blue-600 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center space-x-2 font-medium shadow-sm"
+            >
+              {loading ? (
+                <Loader2 className="w-5 h-5 animate-spin" />
+              ) : (
+                <Send className="w-5 h-5" />
+              )}
+              <span>Send</span>
+            </button>
+          </div>
+          <p className="text-xs text-gray-500 mt-2 text-center">
+            Filtering results for: <span className="font-medium text-blue-600">{userContext.userLocation}</span>
+          </p>
+        </div>
+      </div>
+
+      {/* Citation Modal */}
+      {selectedCitation && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden">
+            <div className="flex items-center justify-between p-6 border-b border-gray-200">
+              <h3 className="text-lg font-bold text-gray-800 flex items-center">
+                <FileText className="w-5 h-5 mr-2 text-blue-500" />
+                Document Citation
+              </h3>
+              <button
+                onClick={closeCitationModal}
+                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              >
+                <X className="w-5 h-5 text-gray-500" />
+              </button>
+            </div>
+            <div className="p-6 overflow-y-auto max-h-[60vh]">
+              <div className="space-y-4">
+                <div>
+                  <label className="text-sm font-semibold text-gray-600">Document Name</label>
+                  <p className="mt-1 text-gray-800">{selectedCitation.displayText}</p>
+                </div>
+                <div>
+                  <label className="text-sm font-semibold text-gray-600">Blob URL</label>
+                  <div className="mt-1 p-3 bg-gray-50 rounded-lg break-all">
+                    <a
+                      href={getBlobUrl(selectedCitation.url)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-blue-600 hover:text-blue-800 text-sm hover:underline"
+                    >
+                      {getBlobUrl(selectedCitation.url)}
+                    </a>
+                  </div>
+                </div>
+                <div className="pt-4">
+                  <a
+                    href={getBlobUrl(selectedCitation.url)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-xl hover:from-blue-600 hover:to-indigo-700 transition-all font-medium"
+                  >
+                    <ExternalLink className="w-5 h-5" />
+                    <span>Open Document</span>
+                  </a>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default App;
