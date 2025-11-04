@@ -20,6 +20,7 @@ USE_SHEET_NAME_AS_TABLE = True  # If True, uses sheet name as table name (with p
 REMOVE_EMPTY_COLUMNS = True  # Remove columns that are completely empty
 REMOVE_EMPTY_ROWS = True  # Remove rows that are completely empty
 MIN_NON_NULL_VALUES = 1  # Minimum non-null values required per row to keep it (set to 0 to keep all rows)
+SANITIZE_COLUMN_NAMES = False  # If True, sanitizes column names; if False, keeps original names
 
 def sanitize_table_name(name):
     """
@@ -83,27 +84,46 @@ def create_table_for_sheet(cursor, table_name, df):
     # Drop table if exists (comment out if you want to keep existing data)
     cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
     
-    # Sanitize column names
+    # Handle column names
     column_mapping = {}
-    sanitized_columns = []
-    for col in df.columns:
-        sanitized = sanitize_column_name(col)
-        # Ensure unique column names
-        counter = 1
-        original_sanitized = sanitized
-        while sanitized in sanitized_columns:
-            sanitized = f"{original_sanitized}_{counter}"
-            counter += 1
-        sanitized_columns.append(sanitized)
-        column_mapping[col] = sanitized
+    final_columns = []
+    
+    if SANITIZE_COLUMN_NAMES:
+        # Sanitize column names
+        sanitized_columns = []
+        for col in df.columns:
+            sanitized = sanitize_column_name(col)
+            # Ensure unique column names
+            counter = 1
+            original_sanitized = sanitized
+            while sanitized in sanitized_columns:
+                sanitized = f"{original_sanitized}_{counter}"
+                counter += 1
+            sanitized_columns.append(sanitized)
+            column_mapping[col] = sanitized
+        final_columns = sanitized_columns
+    else:
+        # Keep original column names
+        used_columns = []
+        for col in df.columns:
+            col_name = str(col)
+            # Ensure unique column names
+            counter = 1
+            original_col = col_name
+            while col_name in used_columns:
+                col_name = f"{original_col}_{counter}"
+                counter += 1
+            used_columns.append(col_name)
+            column_mapping[col] = col_name
+        final_columns = used_columns
     
     # Create column definitions
     column_definitions = []
-    for original_col, sanitized_col in column_mapping.items():
+    for original_col, final_col in column_mapping.items():
         dtype = str(df[original_col].dtype)
         sample_data = df[original_col].dropna().head(100).tolist()
         sql_type = get_sql_type(dtype, sample_data)
-        column_definitions.append(f"[{sanitized_col}] {sql_type}")
+        column_definitions.append(f"[{final_col}] {sql_type}")
     
     # Add metadata columns
     column_definitions.append("[InsertedAt] DATETIME DEFAULT GETDATE()")
