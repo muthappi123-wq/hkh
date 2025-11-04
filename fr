@@ -1,449 +1,320 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Send, FileText, ExternalLink, AlertCircle, CheckCircle, Loader2, User, Bot, X } from 'lucide-react';
+import pymssql
+import pandas as pd
+import os
+from datetime import datetime
 
-// Configuration - Update these with your actual values
-const API_BASE_URL = 'http://localhost:8000';
-const BLOB_BASE_URL = 'https://yourstorageaccount.blob.core.windows.net/yourcontainer';
+# Azure SQL Database Configuration
+SERVER = 'your-server.database.windows.net'
+DATABASE = 'your-database-name'
+USERNAME = 'your-username'
+PASSWORD = 'your-password'
 
-const App = () => {
-  const [messages, setMessages] = useState([]);
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [userContext, setUserContext] = useState({
-    userId: 'user_001',
-    userName: 'John Doe',
-    userLocation: 'United States',
-    deviceType: 'web',
-    sessionId: `session_${Date.now()}`,
-    bearerToken: '',
-    scopeIndex: 0,
-    userCategory: 'general'
-  });
-  const [showSettings, setShowSettings] = useState(false);
-  const [selectedCitation, setSelectedCitation] = useState(null);
-  const messagesEndRef = useRef(null);
+# Excel file path
+EXCEL_FILE = 'your_file.xlsx'
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+# Table naming options
+TABLE_PREFIX = 'imported_'  # Prefix for table names
+USE_SHEET_NAME_AS_TABLE = True  # If True, uses sheet name as table name (with prefix)
 
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
+# Data cleaning options
+REMOVE_EMPTY_COLUMNS = True  # Remove columns that are completely empty
+REMOVE_EMPTY_ROWS = True  # Remove rows that are completely empty
+MIN_NON_NULL_VALUES = 1  # Minimum non-null values required per row to keep it (set to 0 to keep all rows)
 
-  const sendMessage = async () => {
-    if (!input.trim() || loading) return;
+def sanitize_table_name(name):
+    """
+    Sanitize sheet name to be a valid SQL table name
+    """
+    # Replace spaces and special characters with underscores
+    sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
+    # Remove consecutive underscores
+    sanitized = '_'.join(filter(None, sanitized.split('_')))
+    # Ensure it doesn't start with a number
+    if sanitized and sanitized[0].isdigit():
+        sanitized = 'Sheet_' + sanitized
+    return sanitized
 
-    const userMessage = {
-      type: 'user',
-      content: input,
-      timestamp: new Date().toISOString()
-    };
+def sanitize_column_name(name):
+    """
+    Sanitize column name to be valid SQL column name
+    """
+    # Replace spaces and special characters with underscores
+    sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in str(name))
+    # Remove consecutive underscores
+    sanitized = '_'.join(filter(None, sanitized.split('_')))
+    # Ensure it doesn't start with a number
+    if sanitized and sanitized[0].isdigit():
+        sanitized = 'Col_' + sanitized
+    # Handle empty column names
+    if not sanitized:
+        sanitized = 'Column'
+    return sanitized
 
-    setMessages(prev => [...prev, userMessage]);
-    setInput('');
-    setLoading(true);
+def get_sql_type(dtype, sample_data=None):
+    """
+    Map pandas dtype to SQL Server data type
+    """
+    if dtype == 'int64':
+        return 'BIGINT'
+    elif dtype == 'int32':
+        return 'INT'
+    elif dtype == 'float64':
+        return 'FLOAT'
+    elif dtype == 'datetime64[ns]':
+        return 'DATETIME'
+    elif dtype == 'bool':
+        return 'BIT'
+    else:
+        # For string types, try to determine appropriate length
+        if sample_data is not None and len(sample_data) > 0:
+            max_len = max([len(str(x)) for x in sample_data if pd.notna(x)] or [0])
+            if max_len > 4000:
+                return 'NVARCHAR(MAX)'
+            elif max_len > 0:
+                # Add 50% buffer to max length, minimum 50
+                varchar_len = max(50, int(max_len * 1.5))
+                return f'NVARCHAR({min(varchar_len, 4000)})'
+        return 'NVARCHAR(MAX)'
 
-    try {
-      const response = await fetch(`${API_BASE_URL}/query`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          textInput: input,
-          userContext: userContext
-        })
-      });
+def create_table_for_sheet(cursor, table_name, df):
+    """
+    Creates a table based on DataFrame structure
+    """
+    # Drop table if exists (comment out if you want to keep existing data)
+    cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
+    
+    # Sanitize column names
+    column_mapping = {}
+    sanitized_columns = []
+    for col in df.columns:
+        sanitized = sanitize_column_name(col)
+        # Ensure unique column names
+        counter = 1
+        original_sanitized = sanitized
+        while sanitized in sanitized_columns:
+            sanitized = f"{original_sanitized}_{counter}"
+            counter += 1
+        sanitized_columns.append(sanitized)
+        column_mapping[col] = sanitized
+    
+    # Create column definitions
+    column_definitions = []
+    for original_col, sanitized_col in column_mapping.items():
+        dtype = str(df[original_col].dtype)
+        sample_data = df[original_col].dropna().head(100).tolist()
+        sql_type = get_sql_type(dtype, sample_data)
+        column_definitions.append(f"[{sanitized_col}] {sql_type}")
+    
+    # Add metadata columns
+    column_definitions.append("[InsertedAt] DATETIME DEFAULT GETDATE()")
+    
+    create_table_sql = f"""
+    CREATE TABLE {table_name} (
+        [ID] INT IDENTITY(1,1) PRIMARY KEY,
+        {', '.join(column_definitions)}
+    )
+    """
+    
+    cursor.execute(create_table_sql)
+    print(f"  ✓ Table '{table_name}' created with {len(column_mapping)} columns")
+    
+    return column_mapping
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
+def insert_dataframe_to_sql(cursor, df, table_name, column_mapping):
+    """
+    Insert DataFrame rows into SQL table using column mapping
+    """
+    if df.empty:
+        print("  ! Sheet is empty. Skipping...")
+        return 0
+    
+    # Replace NaN with None for proper NULL handling
+    df = df.where(pd.notnull(df), None)
+    
+    # Use sanitized column names
+    sanitized_columns = [column_mapping[col] for col in df.columns]
+    columns_str = ', '.join([f'[{col}]' for col in sanitized_columns])
+    
+    # Prepare placeholders
+    placeholders = ', '.join(['%s'] * len(sanitized_columns))
+    
+    insert_sql = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+    
+    # Insert rows in batches
+    rows_inserted = 0
+    batch_size = 1000
+    rows = []
+    
+    for idx, row in df.iterrows():
+        try:
+            values = [row[col] for col in df.columns]
+            rows.append(values)
+            
+            # Execute batch
+            if len(rows) >= batch_size:
+                cursor.executemany(insert_sql, rows)
+                rows_inserted += len(rows)
+                rows = []
+                print(f"  ... inserted {rows_inserted} rows", end='\r')
+        except Exception as e:
+            print(f"\n  ! Error inserting row {idx}: {e}")
+            continue
+    
+    # Insert remaining rows
+    if rows:
+        try:
+            cursor.executemany(insert_sql, rows)
+            rows_inserted += len(rows)
+        except Exception as e:
+            print(f"\n  ! Error inserting final batch: {e}")
+    
+    return rows_inserted
 
-      const data = await response.json();
+def clean_dataframe(df):
+    """
+    Clean DataFrame by removing empty columns and rows, handling unnamed columns
+    """
+    original_rows = len(df)
+    original_cols = len(df.columns)
+    
+    # Handle unnamed columns - rename them
+    new_columns = []
+    unnamed_counter = 1
+    for col in df.columns:
+        if pd.isna(col) or str(col).startswith('Unnamed:') or str(col).strip() == '':
+            new_columns.append(f'Column_{unnamed_counter}')
+            unnamed_counter += 1
+        else:
+            new_columns.append(col)
+    df.columns = new_columns
+    
+    # Remove completely empty columns (all NaN or empty strings)
+    if REMOVE_EMPTY_COLUMNS:
+        df = df.dropna(axis=1, how='all')
+        df = df.loc[:, (df != '').any(axis=0)]
+    
+    # Remove completely empty rows (all NaN or empty strings)
+    if REMOVE_EMPTY_ROWS:
+        df = df.dropna(axis=0, how='all')
+        df = df.loc[(df != '').any(axis=1)]
+    
+    # Remove rows with too few non-null values
+    if MIN_NON_NULL_VALUES > 0:
+        # Count non-null, non-empty values per row
+        non_null_count = df.apply(lambda row: sum(pd.notna(row) & (row != '')), axis=1)
+        df = df[non_null_count >= MIN_NON_NULL_VALUES]
+    
+    # Reset index after dropping rows
+    df = df.reset_index(drop=True)
+    
+    rows_removed = original_rows - len(df)
+    cols_removed = original_cols - len(df.columns)
+    
+    if rows_removed > 0 or cols_removed > 0:
+        print(f"  Cleaned: Removed {cols_removed} empty columns and {rows_removed} rows")
+        if MIN_NON_NULL_VALUES > 1:
+            print(f"  (Rows must have at least {MIN_NON_NULL_VALUES} non-empty values)")
+    
+    return df
 
-      const botMessage = {
-        type: 'bot',
-        content: data.responseText,
-        timestamp: new Date().toISOString(),
-        citations: data.documentCitations || [],
-        links: data.links || [],
-        exceptionLinks: data.exceptionLinks || [],
-        exceptionFlag: data.exceptionFlag || false,
-        topic: data.topic || '',
-        confidenceScore: data.confidenceScore || 0,
-        suggestedQuestions: data.suggestedQuestions || []
-      };
+def main():
+    """
+    Main function to read Excel and insert into Azure SQL
+    """
+    try:
+        # Check if Excel file exists
+        if not os.path.exists(EXCEL_FILE):
+            print(f"✗ Error: Excel file '{EXCEL_FILE}' not found!")
+            return
+        
+        print(f"Reading Excel file: {EXCEL_FILE}")
+        
+        # Read all sheets from Excel
+        excel_file = pd.ExcelFile(EXCEL_FILE)
+        sheet_names = excel_file.sheet_names
+        print(f"Found {len(sheet_names)} sheets: {sheet_names}\n")
+        
+        # Connect to Azure SQL Database
+        print(f"Connecting to Azure SQL Database: {SERVER}/{DATABASE}")
+        conn = pymssql.connect(
+            server=SERVER,
+            user=USERNAME,
+            password=PASSWORD,
+            database=DATABASE,
+            as_dict=False
+        )
+        cursor = conn.cursor()
+        print("✓ Connected successfully!\n")
+        
+        # Process each sheet
+        total_rows_inserted = 0
+        tables_created = []
+        
+        for sheet_name in sheet_names:
+            print(f"{'='*60}")
+            print(f"Processing sheet: '{sheet_name}'")
+            print(f"{'='*60}")
+            
+            # Read sheet into DataFrame
+            df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
+            print(f"  Original - Rows: {len(df)}, Columns: {len(df.columns)}")
+            
+            # Clean the DataFrame
+            df = clean_dataframe(df)
+            
+            print(f"  After cleaning - Rows: {len(df)}, Columns: {len(df.columns)}")
+            print(f"  Columns: {list(df.columns)}")
+            
+            if df.empty or len(df.columns) == 0:
+                print(f"  ! Skipping empty sheet after cleaning\n")
+                continue
+            
+            # Generate table name
+            if USE_SHEET_NAME_AS_TABLE:
+                table_name = TABLE_PREFIX + sanitize_table_name(sheet_name)
+            else:
+                table_name = f"{TABLE_PREFIX}sheet_{len(tables_created) + 1}"
+            
+            # Create table
+            column_mapping = create_table_for_sheet(cursor, table_name, df)
+            
+            # Insert data
+            rows_inserted = insert_dataframe_to_sql(cursor, df, table_name, column_mapping)
+            total_rows_inserted += rows_inserted
+            tables_created.append(table_name)
+            print(f"  ✓ Inserted {rows_inserted} rows into '{table_name}'\n")
+        
+        # Commit transaction
+        conn.commit()
+        
+        print(f"{'='*60}")
+        print(f"✓ SUCCESS!")
+        print(f"{'='*60}")
+        print(f"Total rows inserted: {total_rows_inserted}")
+        print(f"Tables created: {len(tables_created)}")
+        for table in tables_created:
+            print(f"  - {table}")
+        
+    except pymssql.Error as e:
+        print(f"\n✗ Database Error: {e}")
+        if 'conn' in locals():
+            conn.rollback()
+    except Exception as e:
+        print(f"\n✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Close connections
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            conn.close()
+            print("\n✓ Database connection closed")
 
-      setMessages(prev => [...prev, botMessage]);
-    } catch (error) {
-      console.error('Error:', error);
-      const errorMessage = {
-        type: 'bot',
-        content: 'Sorry, I encountered an error processing your request. Please try again.',
-        timestamp: new Date().toISOString(),
-        isError: true
-      };
-      setMessages(prev => [...prev, errorMessage]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleKeyPress = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
-    }
-  };
-
-  const openCitation = (citation) => {
-    setSelectedCitation(citation);
-  };
-
-  const closeCitationModal = () => {
-    setSelectedCitation(null);
-  };
-
-  const getBlobUrl = (blobFilepath) => {
-    if (!blobFilepath) return '#';
-    // If the filepath already contains the full URL, return it
-    if (blobFilepath.startsWith('http')) return blobFilepath;
-    // Otherwise, construct the URL
-    return `${BLOB_BASE_URL}/${blobFilepath}`;
-  };
-
-  return (
-    <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
-      {/* Header */}
-      <header className="bg-white shadow-md border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
-          <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-lg flex items-center justify-center">
-              <Bot className="w-6 h-6 text-white" />
-            </div>
-            <div>
-              <h1 className="text-xl font-bold text-gray-800">AI Assistant</h1>
-              <p className="text-xs text-gray-500">Multi-Index Retriever</p>
-            </div>
-          </div>
-          <button
-            onClick={() => setShowSettings(!showSettings)}
-            className="px-4 py-2 bg-gray-100 hover:bg-gray-200 rounded-lg text-sm font-medium text-gray-700 transition-colors"
-          >
-            Settings
-          </button>
-        </div>
-      </header>
-
-      {/* Settings Panel */}
-      {showSettings && (
-        <div className="bg-white border-b border-gray-200 shadow-sm">
-          <div className="max-w-7xl mx-auto px-4 py-4">
-            <h3 className="text-sm font-semibold text-gray-700 mb-3">User Context</h3>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div>
-                <label className="block text-xs text-gray-600 mb-1">User ID</label>
-                <input
-                  type="text"
-                  value={userContext.userId}
-                  onChange={(e) => setUserContext({...userContext, userId: e.target.value})}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-600 mb-1">User Name</label>
-                <input
-                  type="text"
-                  value={userContext.userName}
-                  onChange={(e) => setUserContext({...userContext, userName: e.target.value})}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-600 mb-1">Country/Location</label>
-                <input
-                  type="text"
-                  value={userContext.userLocation}
-                  onChange={(e) => setUserContext({...userContext, userLocation: e.target.value})}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder="e.g., United States, India"
-                />
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Chat Messages */}
-      <div className="flex-1 overflow-y-auto px-4 py-6">
-        <div className="max-w-4xl mx-auto space-y-6">
-          {messages.length === 0 && (
-            <div className="text-center py-12">
-              <div className="w-20 h-20 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Bot className="w-10 h-10 text-white" />
-              </div>
-              <h2 className="text-2xl font-bold text-gray-800 mb-2">How can I help you today?</h2>
-              <p className="text-gray-600">Ask me anything and I'll search through our knowledge base</p>
-            </div>
-          )}
-
-          {messages.map((message, index) => (
-            <div key={index} className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`flex space-x-3 max-w-3xl ${message.type === 'user' ? 'flex-row-reverse space-x-reverse' : ''}`}>
-                {/* Avatar */}
-                <div className={`w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0 ${
-                  message.type === 'user' 
-                    ? 'bg-gradient-to-br from-green-400 to-emerald-500' 
-                    : 'bg-gradient-to-br from-blue-500 to-indigo-600'
-                }`}>
-                  {message.type === 'user' ? (
-                    <User className="w-5 h-5 text-white" />
-                  ) : (
-                    <Bot className="w-5 h-5 text-white" />
-                  )}
-                </div>
-
-                {/* Message Content */}
-                <div className={`flex-1 ${message.type === 'user' ? 'items-end' : 'items-start'}`}>
-                  <div className={`rounded-2xl px-4 py-3 ${
-                    message.type === 'user'
-                      ? 'bg-gradient-to-br from-green-400 to-emerald-500 text-white'
-                      : message.isError
-                      ? 'bg-red-50 text-red-800 border border-red-200'
-                      : 'bg-white text-gray-800 shadow-sm border border-gray-200'
-                  }`}>
-                    {message.exceptionFlag && (
-                      <div className="flex items-center space-x-2 mb-2 pb-2 border-b border-gray-200">
-                        <AlertCircle className="w-4 h-4 text-orange-500" />
-                        <span className="text-xs font-medium text-orange-600">Exception Response</span>
-                      </div>
-                    )}
-                    
-                    <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
-
-                    {/* Confidence Score */}
-                    {message.confidenceScore > 0 && (
-                      <div className="mt-2 pt-2 border-t border-gray-200 flex items-center justify-between">
-                        <span className="text-xs text-gray-500">Confidence</span>
-                        <span className="text-xs font-medium text-blue-600">{message.confidenceScore}%</span>
-                      </div>
-                    )}
-
-                    {/* Topic */}
-                    {message.topic && (
-                      <div className="mt-1">
-                        <span className="inline-block px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded-full">
-                          {message.topic}
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Citations */}
-                  {message.citations && message.citations.length > 0 && (
-                    <div className="mt-3 space-y-2">
-                      <p className="text-xs font-semibold text-gray-600 flex items-center">
-                        <FileText className="w-3 h-3 mr-1" />
-                        Document Citations
-                      </p>
-                      <div className="space-y-1">
-                        {message.citations.map((citation, idx) => (
-                          <button
-                            key={idx}
-                            onClick={() => openCitation(citation)}
-                            className="flex items-center space-x-2 px-3 py-2 bg-blue-50 hover:bg-blue-100 rounded-lg text-xs text-left w-full transition-colors group"
-                          >
-                            <FileText className="w-4 h-4 text-blue-500 flex-shrink-0" />
-                            <span className="text-blue-700 group-hover:text-blue-900 flex-1 truncate">
-                              {citation.displayText}
-                            </span>
-                            <ExternalLink className="w-3 h-3 text-blue-400 opacity-0 group-hover:opacity-100 transition-opacity" />
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Application Links */}
-                  {message.links && message.links.length > 0 && (
-                    <div className="mt-3 space-y-2">
-                      <p className="text-xs font-semibold text-gray-600 flex items-center">
-                        <ExternalLink className="w-3 h-3 mr-1" />
-                        Related Links
-                      </p>
-                      <div className="space-y-1">
-                        {message.links.map((link, idx) => (
-                          <a
-                            key={idx}
-                            href={link.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex items-center space-x-2 px-3 py-2 bg-green-50 hover:bg-green-100 rounded-lg text-xs transition-colors group"
-                          >
-                            <ExternalLink className="w-4 h-4 text-green-500 flex-shrink-0" />
-                            <span className="text-green-700 group-hover:text-green-900 flex-1">
-                              {link.displayText}
-                            </span>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Exception Links */}
-                  {message.exceptionLinks && message.exceptionLinks.length > 0 && (
-                    <div className="mt-3 space-y-2">
-                      <p className="text-xs font-semibold text-gray-600 flex items-center">
-                        <AlertCircle className="w-3 h-3 mr-1" />
-                        Exception Resources
-                      </p>
-                      <div className="space-y-1">
-                        {message.exceptionLinks.map((link, idx) => (
-                          <a
-                            key={idx}
-                            href={link.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="flex items-center space-x-2 px-3 py-2 bg-orange-50 hover:bg-orange-100 rounded-lg text-xs transition-colors group"
-                          >
-                            <ExternalLink className="w-4 h-4 text-orange-500 flex-shrink-0" />
-                            <span className="text-orange-700 group-hover:text-orange-900 flex-1">
-                              {link.displayText}
-                            </span>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Suggested Questions */}
-                  {message.suggestedQuestions && message.suggestedQuestions.length > 0 && (
-                    <div className="mt-3 space-y-2">
-                      <p className="text-xs font-semibold text-gray-600">You might also ask:</p>
-                      <div className="space-y-1">
-                        {message.suggestedQuestions.map((question, idx) => (
-                          <button
-                            key={idx}
-                            onClick={() => setInput(question)}
-                            className="block w-full text-left px-3 py-2 bg-purple-50 hover:bg-purple-100 rounded-lg text-xs text-purple-700 hover:text-purple-900 transition-colors"
-                          >
-                            {question}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          ))}
-
-          {loading && (
-            <div className="flex justify-start">
-              <div className="flex space-x-3 max-w-3xl">
-                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center flex-shrink-0">
-                  <Bot className="w-5 h-5 text-white" />
-                </div>
-                <div className="bg-white rounded-2xl px-4 py-3 shadow-sm border border-gray-200">
-                  <div className="flex items-center space-x-2">
-                    <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
-                    <span className="text-sm text-gray-600">Thinking...</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
-          <div ref={messagesEndRef} />
-        </div>
-      </div>
-
-      {/* Input Area */}
-      <div className="bg-white border-t border-gray-200 shadow-lg">
-        <div className="max-w-4xl mx-auto px-4 py-4">
-          <div className="flex space-x-3">
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyPress={handleKeyPress}
-              placeholder="Ask me anything..."
-              disabled={loading}
-              className="flex-1 px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100 disabled:cursor-not-allowed"
-            />
-            <button
-              onClick={sendMessage}
-              disabled={loading || !input.trim()}
-              className="px-6 py-3 bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-xl hover:from-blue-600 hover:to-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center space-x-2 font-medium shadow-sm"
-            >
-              {loading ? (
-                <Loader2 className="w-5 h-5 animate-spin" />
-              ) : (
-                <Send className="w-5 h-5" />
-              )}
-              <span>Send</span>
-            </button>
-          </div>
-          <p className="text-xs text-gray-500 mt-2 text-center">
-            Filtering results for: <span className="font-medium text-blue-600">{userContext.userLocation}</span>
-          </p>
-        </div>
-      </div>
-
-      {/* Citation Modal */}
-      {selectedCitation && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-hidden">
-            <div className="flex items-center justify-between p-6 border-b border-gray-200">
-              <h3 className="text-lg font-bold text-gray-800 flex items-center">
-                <FileText className="w-5 h-5 mr-2 text-blue-500" />
-                Document Citation
-              </h3>
-              <button
-                onClick={closeCitationModal}
-                className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
-              >
-                <X className="w-5 h-5 text-gray-500" />
-              </button>
-            </div>
-            <div className="p-6 overflow-y-auto max-h-[60vh]">
-              <div className="space-y-4">
-                <div>
-                  <label className="text-sm font-semibold text-gray-600">Document Name</label>
-                  <p className="mt-1 text-gray-800">{selectedCitation.displayText}</p>
-                </div>
-                <div>
-                  <label className="text-sm font-semibold text-gray-600">Blob URL</label>
-                  <div className="mt-1 p-3 bg-gray-50 rounded-lg break-all">
-                    <a
-                      href={getBlobUrl(selectedCitation.url)}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-blue-600 hover:text-blue-800 text-sm hover:underline"
-                    >
-                      {getBlobUrl(selectedCitation.url)}
-                    </a>
-                  </div>
-                </div>
-                <div className="pt-4">
-                  <a
-                    href={getBlobUrl(selectedCitation.url)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="w-full flex items-center justify-center space-x-2 px-4 py-3 bg-gradient-to-br from-blue-500 to-indigo-600 text-white rounded-xl hover:from-blue-600 hover:to-indigo-700 transition-all font-medium"
-                  >
-                    <ExternalLink className="w-5 h-5" />
-                    <span>Open Document</span>
-                  </a>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-export default App;
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Excel to Azure SQL Database Import Script")
+    print("Multiple Sheets → Multiple Tables")
+    print("=" * 60)
+    print()
+    main()
