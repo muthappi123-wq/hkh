@@ -84,6 +84,9 @@ def create_table_for_sheet(cursor, table_name, df):
     # Drop table if exists (comment out if you want to keep existing data)
     cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
     
+    # CRITICAL: Work with the actual current column names in the DataFrame
+    actual_columns = list(df.columns)
+    
     # Handle column names
     column_mapping = {}
     final_columns = []
@@ -91,7 +94,7 @@ def create_table_for_sheet(cursor, table_name, df):
     if SANITIZE_COLUMN_NAMES:
         # Sanitize column names
         sanitized_columns = []
-        for col in df.columns:
+        for col in actual_columns:
             sanitized = sanitize_column_name(col)
             # Ensure unique column names
             counter = 1
@@ -105,7 +108,7 @@ def create_table_for_sheet(cursor, table_name, df):
     else:
         # Keep original column names
         used_columns = []
-        for col in df.columns:
+        for col in actual_columns:
             col_name = str(col).strip()
             
             # Handle NaN or empty column names
@@ -121,6 +124,10 @@ def create_table_for_sheet(cursor, table_name, df):
             used_columns.append(col_name)
             column_mapping[col] = col_name
         final_columns = used_columns
+    
+    print(f"  Column mapping created: {len(column_mapping)} columns")
+    print(f"  From: {actual_columns}")
+    print(f"  To: {final_columns}")
     
     # Create column definitions
     column_definitions = []
@@ -219,17 +226,22 @@ def clean_dataframe(df):
     new_columns = []
     unnamed_counter = 1
     for col in df.columns:
-        col_str = str(col)
+        # Convert to string first
+        col_str = str(col).strip().lower()
+        
         # Check for various types of unnamed/invalid columns
+        # CRITICAL: Check the actual string value, not just the type
         if (pd.isna(col) or 
-            col_str.lower() == 'nan' or
-            col_str.lower() == 'none' or
-            col_str.startswith('Unnamed:') or 
-            col_str.strip() == ''):
+            col_str == 'nan' or
+            col_str == 'none' or
+            col_str.startswith('unnamed:') or 
+            col_str == ''):
             new_columns.append(f'Column_{unnamed_counter}')
             unnamed_counter += 1
+            print(f"  Renamed problematic column '{col}' (type: {type(col).__name__}) to 'Column_{unnamed_counter-1}'")
         else:
-            new_columns.append(col)
+            # Keep original case
+            new_columns.append(str(col).strip())
     
     df.columns = new_columns
     
