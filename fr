@@ -66,15 +66,7 @@ def get_sql_type(dtype, sample_data=None):
     elif dtype == 'bool':
         return 'BIT'
     else:
-        # For string types, try to determine appropriate length
-        if sample_data is not None and len(sample_data) > 0:
-            max_len = max([len(str(x)) for x in sample_data if pd.notna(x)] or [0])
-            if max_len > 4000:
-                return 'NVARCHAR(MAX)'
-            elif max_len > 0:
-                # Add 50% buffer to max length, minimum 50
-                varchar_len = max(50, int(max_len * 1.5))
-                return f'NVARCHAR({min(varchar_len, 4000)})'
+        # Use NVARCHAR(MAX) for all text columns to avoid truncation issues
         return 'NVARCHAR(MAX)'
 
 def create_table_for_sheet(cursor, table_name, df):
@@ -133,8 +125,7 @@ def create_table_for_sheet(cursor, table_name, df):
     column_definitions = []
     for original_col, final_col in column_mapping.items():
         dtype = str(df[original_col].dtype)
-        sample_data = df[original_col].dropna().head(100).tolist()
-        sql_type = get_sql_type(dtype, sample_data)
+        sql_type = get_sql_type(dtype)
         column_definitions.append(f"[{final_col}] {sql_type}")
     
     # Add metadata columns
