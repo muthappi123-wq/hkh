@@ -209,26 +209,29 @@ def clean_dataframe(df):
     original_rows = len(df)
     original_cols = len(df.columns)
     
-    # Handle unnamed columns - rename them
+    # FIRST: Remove completely empty columns before renaming
+    # This prevents creating Column_N for truly empty columns
+    if REMOVE_EMPTY_COLUMNS:
+        df = df.dropna(axis=1, how='all')
+        df = df.loc[:, (df != '').any(axis=0)]
+    
+    # Handle unnamed/invalid columns - rename them
     new_columns = []
     unnamed_counter = 1
     for col in df.columns:
         col_str = str(col)
         # Check for various types of unnamed/invalid columns
         if (pd.isna(col) or 
-            col_str.lower() == 'nan' or 
+            col_str.lower() == 'nan' or
+            col_str.lower() == 'none' or
             col_str.startswith('Unnamed:') or 
             col_str.strip() == ''):
             new_columns.append(f'Column_{unnamed_counter}')
             unnamed_counter += 1
         else:
             new_columns.append(col)
-    df.columns = new_columns
     
-    # Remove completely empty columns (all NaN or empty strings)
-    if REMOVE_EMPTY_COLUMNS:
-        df = df.dropna(axis=1, how='all')
-        df = df.loc[:, (df != '').any(axis=0)]
+    df.columns = new_columns
     
     # Remove completely empty rows (all NaN or empty strings)
     if REMOVE_EMPTY_ROWS:
@@ -296,12 +299,14 @@ def main():
             df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
             print(f"  Original - Rows: {len(df)}, Columns: {len(df.columns)}")
             print(f"  Original column names: {list(df.columns)}")
+            print(f"  Original column types: {[type(col).__name__ for col in df.columns]}")
             
             # Clean the DataFrame
             df = clean_dataframe(df)
             
             print(f"  After cleaning - Rows: {len(df)}, Columns: {len(df.columns)}")
             print(f"  Cleaned column names: {list(df.columns)}")
+            print(f"  Cleaned column types: {[type(col).__name__ for col in df.columns]}")
             
             if df.empty or len(df.columns) == 0:
                 print(f"  ! Skipping empty sheet after cleaning\n")
