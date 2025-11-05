@@ -156,14 +156,16 @@ def insert_dataframe_to_sql(cursor, df, table_name, column_mapping):
     # Replace NaN with None for proper NULL handling
     df = df.where(pd.notnull(df), None)
     
-    # Use sanitized column names
-    sanitized_columns = [column_mapping[col] for col in df.columns]
-    columns_str = ', '.join([f'[{col}]' for col in sanitized_columns])
+    # Use mapped column names (which are safe SQL identifiers)
+    mapped_columns = [column_mapping[col] for col in df.columns]
+    columns_str = ', '.join([f'[{col}]' for col in mapped_columns])
     
     # Prepare placeholders
-    placeholders = ', '.join(['%s'] * len(sanitized_columns))
+    placeholders = ', '.join(['%s'] * len(mapped_columns))
     
     insert_sql = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+    
+    print(f"  Insert SQL: {insert_sql[:200]}...")  # Debug: show the SQL being used
     
     # Insert rows in batches
     rows_inserted = 0
@@ -172,6 +174,7 @@ def insert_dataframe_to_sql(cursor, df, table_name, column_mapping):
     
     for idx, row in df.iterrows():
         try:
+            # Extract values using ORIGINAL column names from df
             values = [row[col] for col in df.columns]
             rows.append(values)
             
@@ -183,6 +186,8 @@ def insert_dataframe_to_sql(cursor, df, table_name, column_mapping):
                 print(f"  ... inserted {rows_inserted} rows", end='\r')
         except Exception as e:
             print(f"\n  ! Error inserting row {idx}: {e}")
+            # Try to continue with next row
+            rows = []  # Clear failed batch
             continue
     
     # Insert remaining rows
@@ -192,6 +197,8 @@ def insert_dataframe_to_sql(cursor, df, table_name, column_mapping):
             rows_inserted += len(rows)
         except Exception as e:
             print(f"\n  ! Error inserting final batch: {e}")
+            print(f"  ! Problematic columns in DataFrame: {list(df.columns)}")
+            print(f"  ! Mapped column names being used: {mapped_columns}")
     
     return rows_inserted
 
@@ -288,12 +295,13 @@ def main():
             # Read sheet into DataFrame
             df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
             print(f"  Original - Rows: {len(df)}, Columns: {len(df.columns)}")
+            print(f"  Original column names: {list(df.columns)}")
             
             # Clean the DataFrame
             df = clean_dataframe(df)
             
             print(f"  After cleaning - Rows: {len(df)}, Columns: {len(df.columns)}")
-            print(f"  Columns: {list(df.columns)}")
+            print(f"  Cleaned column names: {list(df.columns)}")
             
             if df.empty or len(df.columns) == 0:
                 print(f"  ! Skipping empty sheet after cleaning\n")
