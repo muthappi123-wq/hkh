@@ -106,7 +106,12 @@ def create_table_for_sheet(cursor, table_name, df):
         # Keep original column names
         used_columns = []
         for col in df.columns:
-            col_name = str(col)
+            col_name = str(col).strip()
+            
+            # Handle NaN or empty column names
+            if col_name.lower() == 'nan' or col_name == '' or pd.isna(col):
+                col_name = f'Column_{len(used_columns) + 1}'
+            
             # Ensure unique column names
             counter = 1
             original_col = col_name
@@ -201,7 +206,12 @@ def clean_dataframe(df):
     new_columns = []
     unnamed_counter = 1
     for col in df.columns:
-        if pd.isna(col) or str(col).startswith('Unnamed:') or str(col).strip() == '':
+        col_str = str(col)
+        # Check for various types of unnamed/invalid columns
+        if (pd.isna(col) or 
+            col_str.lower() == 'nan' or 
+            col_str.startswith('Unnamed:') or 
+            col_str.strip() == ''):
             new_columns.append(f'Column_{unnamed_counter}')
             unnamed_counter += 1
         else:
