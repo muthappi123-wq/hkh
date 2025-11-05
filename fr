@@ -1,375 +1,198 @@
-import pymssql
-import pandas as pd
 import os
+import pandas as pd
+import pymssql
 from datetime import datetime
 
+# ======================================================
 # Azure SQL Database Configuration
+# ======================================================
 SERVER = 'your-server.database.windows.net'
 DATABASE = 'your-database-name'
 USERNAME = 'your-username'
 PASSWORD = 'your-password'
 
+# ======================================================
 # Excel file path
+# ======================================================
 EXCEL_FILE = 'your_file.xlsx'
 
-# Table naming options
-TABLE_PREFIX = 'imported_'  # Prefix for table names
-USE_SHEET_NAME_AS_TABLE = True  # If True, uses sheet name as table name (with prefix)
+# ======================================================
+# Configurations
+# ======================================================
+TABLE_PREFIX = 'imported_'        # Prefix for SQL tables
+REMOVE_EMPTY_COLUMNS = True       # Drop completely empty columns
+REMOVE_EMPTY_ROWS = True          # Drop completely empty rows
+MIN_NON_NULL_VALUES = 1           # Keep rows with at least N non-null cells
+SANITIZE_COLUMN_NAMES = True      # Ensure column names are SQL-safe
 
-# Data cleaning options
-REMOVE_EMPTY_COLUMNS = True  # Remove columns that are completely empty
-REMOVE_EMPTY_ROWS = True  # Remove rows that are completely empty
-MIN_NON_NULL_VALUES = 1  # Minimum non-null values required per row to keep it (set to 0 to keep all rows)
-SANITIZE_COLUMN_NAMES = False  # If True, sanitizes column names; if False, keeps original names
-
-def sanitize_table_name(name):
-    """
-    Sanitize sheet name to be a valid SQL table name
-    """
-    # Replace spaces and special characters with underscores
+# ======================================================
+# Utility functions
+# ======================================================
+def sanitize_table_name(name: str) -> str:
+    """Convert sheet name to valid SQL table name."""
     sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
-    # Remove consecutive underscores
     sanitized = '_'.join(filter(None, sanitized.split('_')))
-    # Ensure it doesn't start with a number
     if sanitized and sanitized[0].isdigit():
         sanitized = 'Sheet_' + sanitized
     return sanitized
 
-def sanitize_column_name(name):
-    """
-    Sanitize column name to be valid SQL column name
-    """
-    # Replace spaces and special characters with underscores
-    sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in str(name))
-    # Remove consecutive underscores
+def sanitize_column_name(name: str) -> str:
+    """Convert Excel column name to valid SQL column name."""
+    name = str(name).strip()
+    if pd.isna(name) or name.lower() in ['nan', 'none', '']:
+        name = 'Column'
+    sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in name)
     sanitized = '_'.join(filter(None, sanitized.split('_')))
-    # Ensure it doesn't start with a number
     if sanitized and sanitized[0].isdigit():
         sanitized = 'Col_' + sanitized
-    # Handle empty column names
-    if not sanitized:
-        sanitized = 'Column'
     return sanitized
 
-def get_sql_type(dtype, sample_data=None):
-    """
-    Map pandas dtype to SQL Server data type
-    """
+def get_sql_type(dtype: str, sample_data=None) -> str:
+    """Map pandas dtype to SQL Server data type."""
     if dtype == 'int64':
         return 'BIGINT'
-    elif dtype == 'int32':
-        return 'INT'
     elif dtype == 'float64':
         return 'FLOAT'
-    elif dtype == 'datetime64[ns]':
-        return 'DATETIME'
     elif dtype == 'bool':
         return 'BIT'
+    elif 'datetime' in dtype:
+        return 'DATETIME'
     else:
-        # For string types, try to determine appropriate length
-        if sample_data is not None and len(sample_data) > 0:
+        if sample_data is not None:
             max_len = max([len(str(x)) for x in sample_data if pd.notna(x)] or [0])
             if max_len > 4000:
                 return 'NVARCHAR(MAX)'
-            elif max_len > 0:
-                # Add 50% buffer to max length, minimum 50
-                varchar_len = max(50, int(max_len * 1.5))
-                return f'NVARCHAR({min(varchar_len, 4000)})'
+            varchar_len = max(50, int(max_len * 1.5))
+            return f'NVARCHAR({min(varchar_len, 4000)})'
         return 'NVARCHAR(MAX)'
 
-def create_table_for_sheet(cursor, table_name, df):
-    """
-    Creates a table based on DataFrame structure
-    """
-    # Drop table if exists (comment out if you want to keep existing data)
-    cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
-    
-    # CRITICAL: Work with the actual current column names in the DataFrame
-    actual_columns = list(df.columns)
-    
-    # Handle column names
-    column_mapping = {}
-    final_columns = []
-    
-    if SANITIZE_COLUMN_NAMES:
-        # Sanitize column names
-        sanitized_columns = []
-        for col in actual_columns:
-            sanitized = sanitize_column_name(col)
-            # Ensure unique column names
-            counter = 1
-            original_sanitized = sanitized
-            while sanitized in sanitized_columns:
-                sanitized = f"{original_sanitized}_{counter}"
-                counter += 1
-            sanitized_columns.append(sanitized)
-            column_mapping[col] = sanitized
-        final_columns = sanitized_columns
-    else:
-        # Keep original column names
-        used_columns = []
-        for col in actual_columns:
-            col_name = str(col).strip()
-            
-            # Handle NaN or empty column names
-            if col_name.lower() == 'nan' or col_name == '' or pd.isna(col):
-                col_name = f'Column_{len(used_columns) + 1}'
-            
-            # Ensure unique column names
-            counter = 1
-            original_col = col_name
-            while col_name in used_columns:
-                col_name = f"{original_col}_{counter}"
-                counter += 1
-            used_columns.append(col_name)
-            column_mapping[col] = col_name
-        final_columns = used_columns
-    
-    print(f"  Column mapping created: {len(column_mapping)} columns")
-    print(f"  From: {actual_columns}")
-    print(f"  To: {final_columns}")
-    
-    # Create column definitions
-    column_definitions = []
-    for original_col, final_col in column_mapping.items():
-        dtype = str(df[original_col].dtype)
-        sample_data = df[original_col].dropna().head(100).tolist()
-        sql_type = get_sql_type(dtype, sample_data)
-        column_definitions.append(f"[{final_col}] {sql_type}")
-    
-    # Add metadata columns
-    column_definitions.append("[InsertedAt] DATETIME DEFAULT GETDATE()")
-    
-    create_table_sql = f"""
-    CREATE TABLE {table_name} (
-        [ID] INT IDENTITY(1,1) PRIMARY KEY,
-        {', '.join(column_definitions)}
-    )
-    """
-    
-    cursor.execute(create_table_sql)
-    print(f"  ✓ Table '{table_name}' created with {len(column_mapping)} columns")
-    
-    return column_mapping
-
-def insert_dataframe_to_sql(cursor, df, table_name, column_mapping):
-    """
-    Insert DataFrame rows into SQL table using column mapping
-    """
-    if df.empty:
-        print("  ! Sheet is empty. Skipping...")
-        return 0
-    
-    # Replace NaN with None for proper NULL handling
-    df = df.where(pd.notnull(df), None)
-    
-    # Use mapped column names (which are safe SQL identifiers)
-    mapped_columns = [column_mapping[col] for col in df.columns]
-    columns_str = ', '.join([f'[{col}]' for col in mapped_columns])
-    
-    # Prepare placeholders
-    placeholders = ', '.join(['%s'] * len(mapped_columns))
-    
-    insert_sql = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
-    
-    print(f"  Insert SQL: {insert_sql[:200]}...")  # Debug: show the SQL being used
-    
-    # Insert rows in batches
-    rows_inserted = 0
-    batch_size = 1000
-    rows = []
-    
-    for idx, row in df.iterrows():
-        try:
-            # Extract values using ORIGINAL column names from df
-            values = [row[col] for col in df.columns]
-            rows.append(values)
-            
-            # Execute batch
-            if len(rows) >= batch_size:
-                cursor.executemany(insert_sql, rows)
-                rows_inserted += len(rows)
-                rows = []
-                print(f"  ... inserted {rows_inserted} rows", end='\r')
-        except Exception as e:
-            print(f"\n  ! Error inserting row {idx}: {e}")
-            # Try to continue with next row
-            rows = []  # Clear failed batch
-            continue
-    
-    # Insert remaining rows
-    if rows:
-        try:
-            cursor.executemany(insert_sql, rows)
-            rows_inserted += len(rows)
-        except Exception as e:
-            print(f"\n  ! Error inserting final batch: {e}")
-            print(f"  ! Problematic columns in DataFrame: {list(df.columns)}")
-            print(f"  ! Mapped column names being used: {mapped_columns}")
-    
-    return rows_inserted
-
-def clean_dataframe(df):
-    """
-    Clean DataFrame by removing empty columns and rows, handling unnamed columns
-    """
-    original_rows = len(df)
-    original_cols = len(df.columns)
-    
-    # FIRST: Remove completely empty columns before renaming
-    # This prevents creating Column_N for truly empty columns
+def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove empty rows/columns and rename unnamed columns."""
     if REMOVE_EMPTY_COLUMNS:
         df = df.dropna(axis=1, how='all')
         df = df.loc[:, (df != '').any(axis=0)]
-    
-    # Handle unnamed/invalid columns - rename them
-    new_columns = []
-    unnamed_counter = 1
-    for col in df.columns:
-        # Convert to string first
-        col_str = str(col).strip().lower()
-        
-        # Check for various types of unnamed/invalid columns
-        # CRITICAL: Check the actual string value, not just the type
-        if (pd.isna(col) or 
-            col_str == 'nan' or
-            col_str == 'none' or
-            col_str.startswith('unnamed:') or 
-            col_str == ''):
-            new_columns.append(f'Column_{unnamed_counter}')
-            unnamed_counter += 1
-            print(f"  Renamed problematic column '{col}' (type: {type(col).__name__}) to 'Column_{unnamed_counter-1}'")
-        else:
-            # Keep original case
-            new_columns.append(str(col).strip())
-    
-    df.columns = new_columns
-    
-    # Remove completely empty rows (all NaN or empty strings)
+
+    # Rename invalid column names
+    new_cols = []
+    for idx, col in enumerate(df.columns):
+        col_name = sanitize_column_name(col)
+        # Avoid duplicates
+        while col_name in new_cols:
+            col_name += f"_{idx}"
+        new_cols.append(col_name)
+    df.columns = new_cols
+
     if REMOVE_EMPTY_ROWS:
         df = df.dropna(axis=0, how='all')
         df = df.loc[(df != '').any(axis=1)]
-    
-    # Remove rows with too few non-null values
-    if MIN_NON_NULL_VALUES > 0:
-        # Count non-null, non-empty values per row
+
+    if MIN_NON_NULL_VALUES > 1:
         non_null_count = df.apply(lambda row: sum(pd.notna(row) & (row != '')), axis=1)
         df = df[non_null_count >= MIN_NON_NULL_VALUES]
-    
-    # Reset index after dropping rows
-    df = df.reset_index(drop=True)
-    
-    rows_removed = original_rows - len(df)
-    cols_removed = original_cols - len(df.columns)
-    
-    if rows_removed > 0 or cols_removed > 0:
-        print(f"  Cleaned: Removed {cols_removed} empty columns and {rows_removed} rows")
-        if MIN_NON_NULL_VALUES > 1:
-            print(f"  (Rows must have at least {MIN_NON_NULL_VALUES} non-empty values)")
-    
-    return df
 
+    return df.reset_index(drop=True)
+
+# ======================================================
+# SQL Operations
+# ======================================================
+def create_table(cursor, table_name, df: pd.DataFrame):
+    """Create SQL table structure from DataFrame."""
+    cursor.execute(f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL DROP TABLE {table_name}")
+
+    columns = []
+    for col in df.columns:
+        sql_type = get_sql_type(str(df[col].dtype), df[col].dropna().head(100).tolist())
+        columns.append(f"[{col}] {sql_type}")
+
+    columns.append("[InsertedAt] DATETIME DEFAULT GETDATE()")
+
+    create_sql = f"""
+    CREATE TABLE {table_name} (
+        [ID] INT IDENTITY(1,1) PRIMARY KEY,
+        {', '.join(columns)}
+    )
+    """
+    cursor.execute(create_sql)
+    print(f"✅ Created table '{table_name}' with {len(df.columns)} columns")
+
+def insert_data(cursor, df: pd.DataFrame, table_name: str):
+    """Insert cleaned data into SQL table."""
+    df = df.where(pd.notnull(df), None)
+    cols = ', '.join(f'[{c}]' for c in df.columns)
+    placeholders = ', '.join(['%s'] * len(df.columns))
+    insert_sql = f"INSERT INTO {table_name} ({cols}) VALUES ({placeholders})"
+
+    batch_size = 1000
+    total_inserted = 0
+    rows = []
+
+    for idx, row in df.iterrows():
+        rows.append(tuple(row))
+        if len(rows) >= batch_size:
+            cursor.executemany(insert_sql, rows)
+            total_inserted += len(rows)
+            rows.clear()
+    if rows:
+        cursor.executemany(insert_sql, rows)
+        total_inserted += len(rows)
+
+    print(f"✅ Inserted {total_inserted} rows into '{table_name}'")
+    return total_inserted
+
+# ======================================================
+# Main Script
+# ======================================================
 def main():
-    """
-    Main function to read Excel and insert into Azure SQL
-    """
+    print("="*60)
+    print("📘 Excel → Azure SQL Import Script")
+    print("="*60)
+
+    if not os.path.exists(EXCEL_FILE):
+        print(f"❌ File not found: {EXCEL_FILE}")
+        return
+
+    # Read Excel file
+    excel = pd.ExcelFile(EXCEL_FILE)
+    print(f"Found sheets: {excel.sheet_names}\n")
+
     try:
-        # Check if Excel file exists
-        if not os.path.exists(EXCEL_FILE):
-            print(f"✗ Error: Excel file '{EXCEL_FILE}' not found!")
-            return
-        
-        print(f"Reading Excel file: {EXCEL_FILE}")
-        
-        # Read all sheets from Excel
-        excel_file = pd.ExcelFile(EXCEL_FILE)
-        sheet_names = excel_file.sheet_names
-        print(f"Found {len(sheet_names)} sheets: {sheet_names}\n")
-        
-        # Connect to Azure SQL Database
-        print(f"Connecting to Azure SQL Database: {SERVER}/{DATABASE}")
-        conn = pymssql.connect(
-            server=SERVER,
-            user=USERNAME,
-            password=PASSWORD,
-            database=DATABASE,
-            as_dict=False
-        )
+        conn = pymssql.connect(SERVER, USERNAME, PASSWORD, DATABASE)
         cursor = conn.cursor()
-        print("✓ Connected successfully!\n")
-        
-        # Process each sheet
-        total_rows_inserted = 0
-        tables_created = []
-        
-        for sheet_name in sheet_names:
-            print(f"{'='*60}")
-            print(f"Processing sheet: '{sheet_name}'")
-            print(f"{'='*60}")
-            
-            # Read sheet into DataFrame
-            df = pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
-            print(f"  Original - Rows: {len(df)}, Columns: {len(df.columns)}")
-            print(f"  Original column names: {list(df.columns)}")
-            print(f"  Original column types: {[type(col).__name__ for col in df.columns]}")
-            
-            # Clean the DataFrame
+        print("✅ Connected to Azure SQL\n")
+
+        total_rows = 0
+        for sheet in excel.sheet_names:
+            print(f"Processing sheet: '{sheet}'")
+            df = pd.read_excel(EXCEL_FILE, sheet_name=sheet)
             df = clean_dataframe(df)
-            
-            print(f"  After cleaning - Rows: {len(df)}, Columns: {len(df.columns)}")
-            print(f"  Cleaned column names: {list(df.columns)}")
-            print(f"  Cleaned column types: {[type(col).__name__ for col in df.columns]}")
-            
-            if df.empty or len(df.columns) == 0:
-                print(f"  ! Skipping empty sheet after cleaning\n")
+
+            if df.empty:
+                print("⚠️ Skipping empty sheet\n")
                 continue
-            
-            # Generate table name
-            if USE_SHEET_NAME_AS_TABLE:
-                table_name = TABLE_PREFIX + sanitize_table_name(sheet_name)
-            else:
-                table_name = f"{TABLE_PREFIX}sheet_{len(tables_created) + 1}"
-            
-            # Create table
-            column_mapping = create_table_for_sheet(cursor, table_name, df)
-            
-            # Insert data
-            rows_inserted = insert_dataframe_to_sql(cursor, df, table_name, column_mapping)
-            total_rows_inserted += rows_inserted
-            tables_created.append(table_name)
-            print(f"  ✓ Inserted {rows_inserted} rows into '{table_name}'\n")
-        
-        # Commit transaction
+
+            table_name = TABLE_PREFIX + sanitize_table_name(sheet)
+            create_table(cursor, table_name, df)
+            inserted = insert_data(cursor, df, table_name)
+            total_rows += inserted
+            print()
+
         conn.commit()
-        
-        print(f"{'='*60}")
-        print(f"✓ SUCCESS!")
-        print(f"{'='*60}")
-        print(f"Total rows inserted: {total_rows_inserted}")
-        print(f"Tables created: {len(tables_created)}")
-        for table in tables_created:
-            print(f"  - {table}")
-        
+        print("="*60)
+        print(f"🎉 Import Completed Successfully!")
+        print(f"Total rows inserted: {total_rows}")
+        print("="*60)
+
     except pymssql.Error as e:
-        print(f"\n✗ Database Error: {e}")
-        if 'conn' in locals():
-            conn.rollback()
+        print(f"❌ Database Error: {e}")
+        conn.rollback()
     except Exception as e:
-        print(f"\n✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Unexpected Error: {e}")
     finally:
-        # Close connections
         if 'cursor' in locals():
             cursor.close()
         if 'conn' in locals():
             conn.close()
-            print("\n✓ Database connection closed")
+            print("🔒 Connection closed")
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Excel to Azure SQL Database Import Script")
-    print("Multiple Sheets → Multiple Tables")
-    print("=" * 60)
-    print()
     main()
